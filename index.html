@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Echo</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;
+    touch-action:none;-webkit-user-select:none;user-select:none;
+    -webkit-tap-highlight-color:transparent}
+  canvas{display:block;width:100vw;height:100vh;background:#000}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(()=>{
+  "use strict";
+  var cv=document.getElementById("c"), ctx=cv.getContext("2d");
+  var scene=document.createElement("canvas"), sctx=scene.getContext("2d");
+  var mask=document.createElement("canvas"),  mctx=mask.getContext("2d");
+  var DPR=Math.min(2, window.devicePixelRatio||1);
+  var W=0,H=0;
+
+  var PULSE_SPEED=1150, PULSE_LIFE=1.15, PULSE_BAND=112;
+  var PR=7;
+  var PSPEED=2.4, PSPEED_PTR=3.6;
+  var HSPEED=1.35, HSCRAPE=1.05, SCRAPE_HEAR=360, HCREEP=0.40, HR=8;
+
+  var walls=[], exitRect=null, player=null, hunter=null, pulses=[], state="play", stateT=0, runT=0;
+  var keys={}, moveTarget=null, stepAcc=0, hunterMoved=0;
+  /* the hunter hears two things: your pulse, and you scraping a wall.
+     wall-feel was free information; now touching the world costs you. */
+  var signal=null, scrapeAcc=0, scrapeFlash=0;
+  var stuckT=0, detourT=0, detour={x:0,y:0};
+
+  /* ---------- sound ---------- */
+  var AC=null, master=null, noiseBuf=null, drone=null, droneGain=null;
+
+  function audioInit(){
+    if(AC) return;
+    var Ctx=window.AudioContext||window.webkitAudioContext;
+    if(!Ctx) return;
+    try{ AC=new Ctx(); }catch(e){ AC=null; return; }
+    master=AC.createGain(); master.gain.value=0.6; master.connect(AC.destination);
+    var n=Math.floor(AC.sampleRate*0.6), b=AC.createBuffer(1,n,AC.sampleRate), d=b.getChannelData(0);
+    for(var i=0;i<n;i++) d[i]=Math.random()*2-1;
+    noiseBuf=b;
+    drone=AC.createOscillator(); drone.type="sine"; drone.frequency.value=46;
+    droneGain=AC.createGain(); droneGain.gain.value=0;
+    drone.connect(droneGain); droneGain.connect(master);
+    try{ drone.start(); }catch(e){}
+  }
+
+  function bus(panVal){
+    if(AC.createStereoPanner){
+      var p=AC.createStereoPanner(); p.pan.value=Math.max(-1,Math.min(1,panVal)); return p;
+    }
+    return AC.createGain();
+  }
+
+  function sfxPulse(){
+    if(!AC) return;
+    var t=AC.currentTime;
+    var src=AC.createBufferSource(); src.buffer=noiseBuf; src.loop=true;
+    var bp=AC.createBiquadFilter(); bp.type="bandpass"; bp.Q.value=1.1;
+    bp.frequency.setValueAtTime(1700,t);
+    bp.frequency.exponentialRampToValueAtTime(280,t+0.34);
+    var g=AC.createGain();
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(0.55,t+0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+0.42);
+    src.connect(bp); bp.connect(g); g.connect(master);
+    src.start(t); src.stop(t+0.46);
+  }
+
+  function sfxStep(panVal,vol){
+    if(!AC) return;
+    var t=AC.currentTime;
+    var src=AC.createBufferSource(); src.buffer=noiseBuf;
+    src.playbackRate.value=0.7;
+    var lp=AC.createBiquadFilter(); lp.type="lowpass"; lp.frequency.value=200;
+    var g=AC.createGain();
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0004,vol),t+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+0.15);
+    var p=bus(panVal);
+    src.connect(lp); lp.connect(g); g.connect(p); p.connect(master);
+    src.start(t); src.stop(t+0.18);
+  }
+
+  function sfxScrape(panVal,vol){
+    if(!AC) return;
+    var t=AC.currentTime;
+    var src=AC.createBufferSource(); src.buffer=noiseBuf; src.loop=true;
+    var bp=AC.createBiquadFilter(); bp.type="bandpass"; bp.Q.value=2.6;
+    bp.frequency.setValueAtTime(420,t);
+    bp.frequency.linearRampToValueAtTime(240,t+0.22);
+    var g=AC.createGain();
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0004,vol),t+0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+0.26);
+    var p=bus(panVal);
+    src.connect(bp); bp.connect(g); g.connect(p); p.connect(master);
+    src.start(t); src.stop(t+0.3);
+  }
+
+  function sfxTone(f0,f1,dur,vol,type){
+    if(!AC) return;
+    var t=AC.currentTime;
+    var o=AC.createOscillator(); o.type=type||"sine";
+    o.frequency.setValueAtTime(f0,t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+dur);
+    var g=AC.createGain();
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(vol,t+0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    o.connect(g); g.connect(master);
+    o.start(t); o.stop(t+dur+0.05);
+  }
+
+  function setDanger(v){
+    if(!AC||!droneGain) return;
+    try{ droneGain.gain.setTargetAtTime(v,AC.currentTime,0.18); }catch(e){}
+  }
+
+  /* ---------- world ---------- */
+  function rnd(a,b){return a+Math.random()*(b-a);}
+  function clamp(v,a,b){return v<a?a:(v>b?b:v);}
+
+  function sidePoint(side, inset){
+    if(side===0) return {x:W-inset, y:rnd(inset, Math.max(inset+1,H-inset))};
+    if(side===1) return {x:inset,   y:rnd(inset, Math.max(inset+1,H-inset))};
+    if(side===2) return {x:rnd(inset, Math.max(inset+1,W-inset)), y:H-inset};
+    return         {x:rnd(inset, Math.max(inset+1,W-inset)), y:inset};
+  }
+
+  function rectsOverlap(a,b,pad){
+    return a.x < b.x+b.w+pad && a.x+a.w+pad > b.x &&
+           a.y < b.y+b.h+pad && a.y+a.h+pad > b.y;
+  }
+
+  function layout(){
+    walls=[];
+    var t=12;
+    walls.push({x:0,y:0,w:W,h:t});
+    walls.push({x:0,y:H-t,w:W,h:t});
+    walls.push({x:0,y:0,w:t,h:H});
+    walls.push({x:W-t,y:0,w:t,h:H});
+
+    /* exit sits on one random side, the player starts on another.
+       fixed corners are what made "never pulse, walk right" work. */
+    var sideE=Math.floor(rnd(0,4));
+    var sideP=(sideE+1+Math.floor(rnd(0,3)))%4;
+    var ep=sidePoint(sideE,47), pp=sidePoint(sideP,46);
+    for(var tr=0; tr<30 && Math.hypot(pp.x-ep.x,pp.y-ep.y) < Math.min(W,H)*0.45; tr++){
+      pp=sidePoint(sideP,46);
+    }
+    exitRect={
+      x: sideE===0 ? W-30-34 : (sideE===1 ? 30 : clamp(ep.x-42,20,Math.max(21,W-20-84))),
+      y: sideE===2 ? H-30-34 : (sideE===3 ? 30 : clamp(ep.y-42,20,Math.max(21,H-20-84))),
+      w: sideE<2 ? 34 : 84,
+      h: sideE<2 ? 84 : 34
+    };
+    player={x:pp.x,y:pp.y};
+
+    /* blocks never overlap each other, the exit, or the player */
+    for(var i=0;i<4;i++){
+      for(var a=0;a<70;a++){
+        var bw=rnd(52,Math.min(170,W*0.22)), bh=rnd(52,Math.min(170,H*0.22));
+        var bx=rnd(W*0.17,Math.max(W*0.18,W*0.83-bw));
+        var by=rnd(H*0.13,Math.max(H*0.14,H*0.87-bh));
+        var cand={x:bx,y:by,w:bw,h:bh};
+        if(rectsOverlap(cand,{x:exitRect.x-26,y:exitRect.y-26,w:exitRect.w+52,h:exitRect.h+52},0)) continue;
+        if(rectsOverlap(cand,{x:player.x-58,y:player.y-58,w:116,h:116},0)) continue;
+        var bad=false;
+        for(var j=0;j<walls.length;j++){ if(rectsOverlap(cand,walls[j],34)){ bad=true; break; } }
+        if(bad) continue;
+        walls.push(cand); break;
+      }
+    }
+
+    var hp=null;
+    for(var k=0;k<80;k++){
+      var q=sidePoint(Math.floor(rnd(0,4)),62);
+      if(blocked(q.x,q.y,HR+6)) continue;
+      if(Math.hypot(q.x-player.x,q.y-player.y) < Math.min(W,H)*0.38) continue;
+      if(circleRect(q.x,q.y,HR+30,exitRect)) continue;
+      hp=q; break;
+    }
+    hunter = hp || {x:W*0.8,y:H*0.2};
+
+    pulses=[]; state="play"; stateT=0; runT=0; stepAcc=0; hunterMoved=0; stuckT=0; detourT=0; detour={x:0,y:0};
+    signal=null; scrapeAcc=0;
+    setDanger(0);
+  }
+
+  function resize(){
+    W=window.innerWidth; H=window.innerHeight;
+    cv.width=W*DPR; cv.height=H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0);
+    scene.width=W*DPR; scene.height=H*DPR; sctx.setTransform(DPR,0,0,DPR,0,0);
+    mask.width=W*DPR; mask.height=H*DPR; mctx.setTransform(DPR,0,0,DPR,0,0);
+    layout();
+  }
+
+  function circleRect(cx,cy,r,R){
+    var nx=Math.max(R.x,Math.min(cx,R.x+R.w));
+    var ny=Math.max(R.y,Math.min(cy,R.y+R.h));
+    var dx=cx-nx, dy=cy-ny;
+    return dx*dx+dy*dy < r*r;
+  }
+  function blocked(cx,cy,r){
+    for(var i=0;i<walls.length;i++) if(circleRect(cx,cy,r,walls[i])) return true;
+    return false;
+  }
+
+  function emit(){
+    if(state!=="play") return;
+    audioInit();
+    pulses.push({x:player.x,y:player.y,t:performance.now()/1000});
+    signal={x:player.x,y:player.y,kind:"pulse",t:performance.now()/1000};
+    sfxPulse();
+  }
+
+  function update(dt){
+    if(state!=="play"){
+      stateT+=dt;
+      setDanger(0);
+      if(stateT>1.15) layout();
+      return;
+    }
+    var ax=0, ay=0;
+    if(keys["ArrowLeft"]||keys["a"]||keys["A"]) ax-=1;
+    if(keys["ArrowRight"]||keys["d"]||keys["D"]) ax+=1;
+    if(keys["ArrowUp"]||keys["w"]||keys["W"]) ay-=1;
+    if(keys["ArrowDown"]||keys["s"]||keys["S"]) ay+=1;
+    if(ax||ay){ var m=Math.hypot(ax,ay); ax/=m; ay/=m; moveTarget=null; }
+    else if(moveTarget){
+      var dx=moveTarget.x-player.x, dy=moveTarget.y-player.y, d=Math.hypot(dx,dy);
+      if(d>6){ ax=dx/d; ay=dy/d; }
+    }
+    var sp = moveTarget?PSPEED_PTR:PSPEED;
+    var nx=player.x+ax*sp, ny=player.y+ay*sp;
+    var scraped=false;
+    if(!blocked(nx,player.y,PR)) player.x=nx; else if(ax) scraped=true;
+    if(!blocked(player.x,ny,PR)) player.y=ny; else if(ay) scraped=true;
+
+    /* dragging along a wall makes noise the hunter can hear */
+    if(scraped && (ax||ay)){
+      scrapeAcc+=dt;
+      if(scrapeAcc>0.34){
+        scrapeAcc=0;
+        scrapeFlash=0.4;
+        var span=(player.x-W*0.5)/Math.max(120,W*0.35);
+        sfxScrape(span,0.22);
+        signal={x:player.x,y:player.y,kind:"scrape",t:performance.now()/1000};
+      }
+    } else scrapeAcc=0;
+    if(scrapeFlash>0) scrapeFlash=Math.max(0,scrapeFlash-dt);
+
+    // hunter: creeps toward you, lunges toward the last pulse.
+    // the creep ramps with time, so a silent run still gets hunted.
+    runT+=dt;
+    var ox=hunter.x, oy=hunter.y;
+    var creep=HCREEP+Math.min(0.55,runT*0.006);
+    var cxp=player.x-hunter.x, cyp=player.y-hunter.y, cd=Math.hypot(cxp,cyp);
+    var mvx=0, mvy=0;
+    if(cd>1){ mvx=cxp/cd*creep; mvy=cyp/cd*creep; }
+    if(signal){
+      var hx=signal.x-hunter.x, hy=signal.y-hunter.y, hd=Math.hypot(hx,hy);
+      /* a pulse carries across the room. a scrape only carries if it is close. */
+      var hear = signal.kind==="pulse" ? 1e9 : SCRAPE_HEAR;
+      var hsp = signal.kind==="pulse" ? HSPEED : HSCRAPE;
+      if(hd>1 && hd<hear){ mvx+=hx/hd*hsp; mvy+=hy/hd*hsp; }
+    }
+    /* boxes are solid to it too. if the straight line is a dead end it goes around. */
+    if(detourT>0){
+      detourT-=dt;
+      var dsp=Math.max(0.6,Math.hypot(mvx,mvy));
+      mvx=detour.x*dsp; mvy=detour.y*dsp;
+    }
+    var bx=hunter.x, by=hunter.y;
+    if(!blocked(hunter.x+mvx,hunter.y,HR)) hunter.x+=mvx;
+    if(!blocked(hunter.x,hunter.y+mvy,HR)) hunter.y+=mvy;
+    var prog=Math.hypot(hunter.x-bx,hunter.y-by), want=Math.hypot(mvx,mvy);
+    if(cd>1 && want>0.01 && prog<want*0.3){
+      stuckT+=dt;
+      if(stuckT>0.3 && detourT<=0){
+        var px=-cyp/cd, py=cxp/cd, probe=26;
+        var freeP=!blocked(hunter.x+px*probe,hunter.y+py*probe,HR);
+        var freeN=!blocked(hunter.x-px*probe,hunter.y-py*probe,HR);
+        var s = (freeP&&!freeN)?1:((freeN&&!freeP)?-1:(Math.random()<0.5?1:-1));
+        detour={x:px*s, y:py*s};
+        detourT=0.7; stuckT=0;
+      }
+    } else { stuckT=0; }
+    hunterMoved=Math.hypot(hunter.x-ox,hunter.y-oy);
+
+    // you can hear it move
+    var hdist=Math.hypot(player.x-hunter.x,player.y-hunter.y);
+    if(hunterMoved>0.05){
+      stepAcc+=dt;
+      if(stepAcc>0.46){
+        stepAcc=0;
+        var pan=(hunter.x-player.x)/Math.max(120,W*0.35);
+        var vol=0.30*Math.max(0,1-hdist/760);
+        if(vol>0.006) sfxStep(pan,vol);
+      }
+    }
+    setDanger(Math.max(0,1-hdist/300)*0.14);
+
+    if(circleRect(player.x,player.y,PR,exitRect)){ state="escaped"; stateT=0; sfxTone(300,940,0.8,0.30,"sine"); setDanger(0); return; }
+    var pdx=player.x-hunter.x, pdy=player.y-hunter.y;
+    if(Math.hypot(pdx,pdy)<PR+HR){ state="caught"; stateT=0; sfxTone(190,42,0.7,0.42,"triangle"); setDanger(0); return; }
+  }
+
+  function draw(now){
+    sctx.clearRect(0,0,W,H);
+    sctx.save();
+    sctx.shadowColor="rgba(140,175,220,0.55)"; sctx.shadowBlur=10;
+    sctx.strokeStyle="rgba(228,236,248,0.92)";
+    sctx.lineWidth=2;
+    for(var i=0;i<walls.length;i++){
+      var w=walls[i];
+      sctx.strokeRect(w.x+0.5,w.y+0.5,w.w-1,w.h-1);
+    }
+    sctx.restore();
+    sctx.save();
+    sctx.shadowColor="rgba(255,220,150,0.9)"; sctx.shadowBlur=18;
+    sctx.fillStyle="rgba(255,238,196,0.96)";
+    sctx.fillRect(exitRect.x,exitRect.y,exitRect.w,exitRect.h);
+    sctx.restore();
+    sctx.save();
+    sctx.shadowColor="rgba(255,80,80,0.9)"; sctx.shadowBlur=14;
+    sctx.beginPath();
+    sctx.arc(hunter.x,hunter.y,HR,0,6.283);
+    sctx.fillStyle="rgba(255,88,88,0.95)";
+    sctx.fill();
+    sctx.restore();
+
+    mctx.clearRect(0,0,W,H);
+    for(var j=0;j<pulses.length;j++){
+      var p=pulses[j], age=now-p.t;
+      if(age<0||age>PULSE_LIFE) continue;
+      var r=age*PULSE_SPEED, a=1-age/PULSE_LIFE;
+      mctx.beginPath();
+      mctx.arc(p.x,p.y,r,0,6.283);
+      mctx.strokeStyle="rgba(255,255,255,"+(a*0.20).toFixed(3)+")";
+      mctx.lineWidth=PULSE_BAND*2.0;
+      mctx.stroke();
+      mctx.beginPath();
+      mctx.arc(p.x,p.y,r,0,6.283);
+      mctx.strokeStyle="rgba(255,255,255,"+(a*0.95).toFixed(3)+")";
+      mctx.lineWidth=PULSE_BAND*0.6;
+      mctx.stroke();
+    }
+    sctx.globalCompositeOperation="destination-in";
+    sctx.drawImage(mask,0,0,W,H);
+    sctx.globalCompositeOperation="source-over";
+
+    ctx.clearRect(0,0,W,H);
+    ctx.drawImage(scene,0,0,W,H);
+
+    if(state==="play"||state==="escaped"){
+      ctx.beginPath(); ctx.arc(player.x,player.y,PR,0,6.283);
+      ctx.fillStyle="rgba(202,216,236,0.55)"; ctx.fill();
+    }
+    for(var k=0;k<pulses.length;k++){
+      var q=pulses[k], ag=now-q.t;
+      if(ag<0||ag>0.25) continue;
+      var al=1-ag/0.25;
+      ctx.beginPath(); ctx.arc(q.x,q.y,2.5,0,6.283);
+      ctx.fillStyle="rgba(255,255,255,"+(al*0.8).toFixed(3)+")"; ctx.fill();
+    }
+    /* a scrape flashes on you, so you learn it is a noise you are making */
+    if(scrapeFlash>0 && state==="play"){
+      var sf=scrapeFlash/0.4, sr=PR+5+(1-sf)*13;
+      ctx.beginPath(); ctx.arc(player.x,player.y,sr,0,6.283);
+      ctx.strokeStyle="rgba(255,130,130,"+(sf*0.55).toFixed(3)+")";
+      ctx.lineWidth=1.5; ctx.stroke();
+    }
+    if(state==="escaped"){
+      var f=Math.max(0,1-stateT/1.15);
+      ctx.fillStyle="rgba(250,250,255,"+(f*0.55).toFixed(3)+")";
+      ctx.fillRect(0,0,W,H);
+    } else if(state==="caught"){
+      var g=Math.max(0,1-stateT/0.4);
+      ctx.fillStyle="rgba(255,70,70,"+(g*0.30).toFixed(3)+")";
+      ctx.fillRect(0,0,W,H);
+    }
+  }
+
+  var last=performance.now()/1000;
+  function frame(){
+    var now=performance.now()/1000, dt=Math.min(0.05,now-last); last=now;
+    update(dt);
+    var keep=[];
+    for(var i=0;i<pulses.length;i++) if(now-pulses[i].t<PULSE_LIFE) keep.push(pulses[i]);
+    pulses=keep;
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener("keydown",(e)=>{
+    if(e.key===" "||e.code==="Space"){ e.preventDefault(); emit(); return; }
+    keys[e.key]=true;
+  });
+  window.addEventListener("keyup",(e)=>{ keys[e.key]=false; });
+
+  var downT=0, downX=0, downY=0, moved=false;
+  cv.addEventListener("pointerdown",(e)=>{
+    e.preventDefault(); cv.setPointerCapture(e.pointerId);
+    downT=performance.now(); downX=e.clientX; downY=e.clientY; moved=false;
+    moveTarget={x:e.clientX,y:e.clientY};
+  });
+  cv.addEventListener("pointermove",(e)=>{
+    if(moveTarget){
+      if(Math.hypot(e.clientX-downX,e.clientY-downY)>10) moved=true;
+      moveTarget={x:e.clientX,y:e.clientY};
+    }
+  });
+  cv.addEventListener("pointerup",(e)=>{
+    e.preventDefault();
+    var quick=(performance.now()-downT)<220 && !moved;
+    moveTarget=null;
+    if(quick) emit();
+  });
+  cv.addEventListener("pointercancel",()=>{ moveTarget=null; });
+
+  window.addEventListener("resize",resize);
+  window.addEventListener("blur",()=>{ keys={}; moveTarget=null; });
+
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
