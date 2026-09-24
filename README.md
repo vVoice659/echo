@@ -5,7 +5,7 @@ and the pulse is also how the hunter finds you.
 
 Seeing and being seen are the same act. That was the whole idea.
 
-Play: https://lowlightgames.itch.io/echo
+Play: [itch.io](https://lowlightgames.itch.io/echo) / [github.io](https://vvoice659.github.io/echo)
 
 ## Controls
 
